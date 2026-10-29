@@ -447,8 +447,20 @@ fn parse_lookup(d: &[u8]) -> Option<Adjustment> {
     read_lookup(d).ok()
 }
 
+/// Match a kept lookup and inspect its transform-profile presence in one pass (#8839).
+/// Presence does not establish ICC validity; unchanged profile bytes remain opaque.
+pub(crate) fn lookup_profile_when_unchanged(data: &[u8], current: &Adjustment) -> Option<bool> {
+    let mut has_profile = false;
+    let parsed = read_lookup_profile(data, &mut has_profile).ok()?;
+    (parsed == *current).then_some(has_profile)
+}
+
 /// [`parse_lookup`] with the reason a block can't be read.
 fn read_lookup(d: &[u8]) -> Result<Adjustment, String> {
+    read_lookup_profile(d, &mut false)
+}
+
+fn read_lookup_profile(d: &[u8], has_profile: &mut bool) -> Result<Adjustment, String> {
     match be16(d, 0) {
         Some(1) => {}
         Some(v) => return Err(format!("unknown version {v}")),
@@ -456,6 +468,7 @@ fn read_lookup(d: &[u8]) -> Result<Adjustment, String> {
     }
     let (v, _) = VersionedDescriptor::parse_prefix(d.get(2..).unwrap_or_default()).map_err(|e| format!("unreadable settings ({e})"))?;
     let desc = v.descriptor;
+    *has_profile = matches!(desc.get("profile"), Some(Value::RawData(bytes)) if !bytes.is_empty());
     let bytes = match desc.get("LUT3DFileData") {
         Some(Value::RawData(b)) if !b.is_empty() => b,
         Some(_) => return Err("its LUT data is empty".into()),

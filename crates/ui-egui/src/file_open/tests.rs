@@ -11,6 +11,38 @@ use std::rc::Rc;
 /// Writes recorded by the fake writer: (path, bytes).
 type Written = Rc<RefCell<Vec<(String, Vec<u8>)>>>;
 
+/// Native visual evidence for #8839, using the real PSD exporter and the normal Save As flow.
+#[test]
+fn color_lookup_export_compatibility_snapshot() {
+    let Some(path) = std::env::var_os("PHOTOCRAFT_LOOKUP_EXPORT_SNAPSHOT") else { return };
+    let _gpu = photocraft_testkit::gpu_lock();
+    let mut h = egui_kittest::Harness::builder().with_size(egui::vec2(1280.0, 800.0)).with_max_steps(64).wgpu().build_eframe(|cc| {
+        PhotocraftApp::setup_context(&cc.egui_ctx, Default::default());
+        let services = Services {
+            export: Some(Box::new(|doc, path, _| {
+                photocraft_io::export(doc, path, &photocraft_io::ExportOptions::default()).map(|r| (r.bytes, r.warnings)).map_err(|e| e.to_string())
+            })),
+            write: Some(Box::new(|_, _| Ok(()))),
+            ..Default::default()
+        };
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), services);
+        app.background_jobs = false;
+        app.run("file.new", json!({"width":640,"height":400,"depth":16,"background":"#5078a0"})).unwrap();
+        let table = photocraft_cms::lutfile::LutFile::from_fn("inverse", 2, |c| c.map(|v| 1.0 - v));
+        let cube = photocraft_cms::lutfile::write_cube(&table);
+        app.run("layer.newAdjustmentLayer.colorLookup", json!({"data":cube,"fileName":"Inverse.cube","interpolation":"trilinear","dither":false})).unwrap();
+        app
+    });
+    h.run_steps(4);
+    let ctx = h.ctx.clone();
+    let saved = menus::invoke(h.state_mut(), &ctx, "file.saveAs", json!({"path":"lookup.psd"})).unwrap();
+    h.run_steps(4);
+    eprintln!("PSD export result: {saved}");
+    let image = h.render().expect("render actual Color Lookup export result");
+    assert_eq!((image.width(), image.height()), (1280, 800));
+    image.save(path).expect("save Color Lookup export screenshot");
+}
+
 /// An app whose importer names the document after the file (like `photocraft-io`) and reports a
 /// warning for names containing "warn", and fails for bytes "bad"; the exporter warns for ".png"
 /// and the writer records what it wrote. Its file dialogs answer with `answers`, in order.

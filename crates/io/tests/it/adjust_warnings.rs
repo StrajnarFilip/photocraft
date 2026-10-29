@@ -45,6 +45,85 @@ fn readable_adjustments_open_without_warnings() {
     }
 }
 
+fn inverse_lookup_document(depth: SampleType) -> Document {
+    let mut doc = Document::with_background(
+        "Lookup export",
+        Size::new(2, 2),
+        ColorMode::Rgb,
+        depth,
+        photocraft_color::Color::rgb(80.0 / 255.0, 120.0 / 255.0, 160.0 / 255.0),
+    );
+    let table = photocraft_cms::lutfile::LutFile::from_fn("inverse", 2, |c| c.map(|v| 1.0 - v));
+    doc.layers.push(Layer::new(
+        "Inverse Look",
+        LayerContent::Adjustment(Adjustment::ColorLookup {
+            name: "inverse.cube".into(),
+            lut: Some(std::sync::Arc::new(table.data)),
+            size: 2,
+            tetrahedral: false,
+            dither: false,
+            source: None,
+        }),
+    ));
+    doc
+}
+
+fn missing_lookup_profile_warning(warnings: &[String]) -> bool {
+    warnings.iter().any(|w| w.contains("\"Inverse Look\"") && w.contains("transform profile") && w.contains("Photoshop"))
+}
+
+#[test]
+fn generated_and_reopened_lookup_exports_warn_about_the_missing_transform_profile() {
+    for depth in [SampleType::U8, SampleType::U16, SampleType::F32] {
+        for (path, force_psb) in [("lookup.psd", false), ("lookup.psb", true)] {
+            let doc = inverse_lookup_document(depth);
+            let opts = ExportOptions { force_psb, ..Default::default() };
+            let saved = export(&doc, path, &opts).unwrap();
+            assert!(missing_lookup_profile_warning(&saved.warnings), "{depth:?} {path}: {:?}", saved.warnings);
+            let back = import(path, &saved.bytes).unwrap().document;
+            let saved_again = export(&back, path, &opts).unwrap();
+            assert!(missing_lookup_profile_warning(&saved_again.warnings), "a kept profile-less block also warns: {:?}", saved_again.warnings);
+            let before = photocraft_compose::flatten(&doc);
+            let after = photocraft_compose::flatten(&back);
+            for (a, b) in before.px.iter().flatten().zip(after.px.iter().flatten()) {
+                assert!((a - b).abs() <= 1.0 / 255.0, "the warning does not change PhotoCraft's rendering");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_kept_lookup_profile_is_preserved_but_an_edited_lookup_warns() {
+    let doc = inverse_lookup_document(SampleType::U16);
+    let saved = export(&doc, "lookup.psd", &ExportOptions::default()).unwrap();
+    let mut file = PsdFile::from_bytes(&saved.bytes).unwrap();
+    let block = file.layers_mut().iter_mut().flat_map(|l| &mut l.blocks).find(|b| b.key == *b"clrL").unwrap();
+    let (mut versioned, _) = VersionedDescriptor::parse_prefix(&block.data[2..]).unwrap();
+    // Opaque original bytes: this test proves preservation, not ICC validation or Photoshop playback.
+    let profile = vec![9, 8, 7, 6];
+    versioned.descriptor.items.retain(|(key, _)| !key.is("profile"));
+    versioned.descriptor.items.push((Id::new("profile"), Value::RawData(profile.clone())));
+    block.data = [vec![0, 1], versioned.to_bytes()].concat();
+    let mut imported = import("native.psd", &file.to_bytes().unwrap()).unwrap().document;
+    let kept = export(&imported, "native.psd", &ExportOptions::default()).unwrap();
+    assert!(!missing_lookup_profile_warning(&kept.warnings), "{:?}", kept.warnings);
+    let parsed = PsdFile::from_bytes(&kept.bytes).unwrap();
+    let block = parsed.layers().iter().flat_map(|l| &l.blocks).find(|b| b.key == *b"clrL").unwrap();
+    let (descriptor, _) = VersionedDescriptor::parse_prefix(&block.data[2..]).unwrap();
+    assert_eq!(descriptor.descriptor.get("profile"), Some(&Value::RawData(profile)));
+    let lookup = imported
+        .layers
+        .iter_mut()
+        .find_map(|l| match &mut l.content {
+            LayerContent::Adjustment(Adjustment::ColorLookup { dither, .. }) => Some(dither),
+            _ => None,
+        })
+        .unwrap();
+    *lookup = true;
+    let changed = export(&imported, "changed.psd", &ExportOptions::default()).unwrap();
+    assert!(missing_lookup_profile_warning(&changed.warnings), "regenerated settings have no matching profile: {:?}", changed.warnings);
+}
+
 /// The raw bytes of a `clrL` block laid out the way Photoshop writes it (Adobe spec): version 1,
 /// then a version 16 descriptor carrying a small `.cube` LUT file (its entry for red maps to
 /// cyan, so the table is not the identity).

@@ -445,7 +445,16 @@ impl Ex {
                     _ => adjust_map::Channels::Other,
                 };
                 let cged = raw.iter().find(|(k, _)| k == b"CgEd").map(|(_, d)| d.clone());
+                let mut lookup_profile_kept = false;
                 let keep = raw.iter().any(|(k, d)| {
+                    // Inspect the same block whose table matches the current adjustment, without
+                    // parsing and copying a potentially large embedded LUT a second time.
+                    if k == b"clrL" && matches!(a, photocraft_doc::Adjustment::ColorLookup { .. }) {
+                        return adjust_map::lookup_profile_when_unchanged(d, a).is_some_and(|has_profile| {
+                            lookup_profile_kept = has_profile;
+                            true
+                        });
+                    }
                     // A previously saved PhotoCraft v2 Photo Filter block may be 18 bytes.
                     // It parses here, but Photoshop requires four-byte alignment, so repair
                     // that legacy record on re-save rather than preserving the broken bytes.
@@ -471,6 +480,15 @@ impl Ex {
                 };
                 let keep = keep
                     || matches!(a, photocraft_doc::Adjustment::Unsupported { raw: r, .. } if raw.iter().any(|(k, d)| own == Some(&k[..]) && d[..] == r[..]));
+                // The generated `clrL` embeds the table but has no compiled transform profile.
+                // Photoshop can show the merged preview and then omit the effect on recomposition
+                // (#8839). A preserved original profile stays opaque; editing the lookup replaces it.
+                if matches!(a, photocraft_doc::Adjustment::ColorLookup { lut: Some(_), .. }) && !lookup_profile_kept {
+                    self.warnings.push(format!(
+                        "layer \"{}\": Color Lookup has no embedded transform profile; Photoshop may ignore this effect. Keep a .pcraft master or export a flattened PNG/TIFF to preserve its appearance",
+                        l.name
+                    ));
+                }
                 if !keep {
                     raw.retain(|(k, _)| !adjust_map::ADJUSTMENT_KEYS.contains(&k) && k != b"CgEd" && own != Some(&k[..]));
                     let w = adjust_map::write(a);
